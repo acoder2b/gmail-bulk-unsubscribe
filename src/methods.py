@@ -1,6 +1,8 @@
+import base64
 import random
 import re
 import time
+from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -702,24 +704,18 @@ class GmailMethod:
         headers = msg.get("payload", {}).get("headers", [])
         return {h["name"]: h["value"] for h in headers}
 
-    def unsubscribe_sender(
+    def _find_representative_headers(
         self, sender_query: str, user_id: str = "me"
-    ) -> Dict[str, Any]:
-        """Attempt to unsubscribe from one sender automatically.
+    ) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+        """Find one message from sender_query and return its
+        List-Unsubscribe-relevant headers. Read-only — looks, doesn't act.
 
-        Looks at a single representative message (unsubscribe targets are
-        per mailing-list, not per message, so one is enough), and:
-          - if the sender supports RFC 8058 one-click unsubscribe, fires the
-            POST directly and reports success/failure
-          - if only a mailto: or a plain web link is available, reports that
-            back rather than guessing — sending an email or loading an
-            unknown page on your behalf are different, riskier actions than
-            reading your own mailbox, so this stops short and tells you
-            instead of acting on it silently.
+        Shared by unsubscribe_sender() (which acts on what it finds) and
+        check_unsubscribe_support() (which only reports what it finds, for
+        the weekly report) so the lookup logic — and its "search Trash too"
+        fix — only exists in one place.
 
-        Returns a dict with at least a "status" key:
-          not_found | no_header | unsubscribed_one_click | http_error |
-          request_failed | manual_link_only | mailto_only | unknown_format
+        Returns (headers, error). Exactly one will be None.
         """
         # in:anywhere is required here specifically — unlike the trash/spam/
         # label operations, this one doesn't care whether the message is
@@ -740,16 +736,62 @@ class GmailMethod:
         )
         messages = [m["id"] for m in response.get("messages", [])]
         if not messages:
-            return {"status": "not_found", "sender": sender_query}
+            return None, "not_found"
 
         try:
-            headers = self.get_unsubscribe_headers(messages[0], user_id)
+            return self.get_unsubscribe_headers(messages[0], user_id), None
         except HttpError as error:
-            return {
-                "status": "fetch_failed",
-                "sender": sender_query,
-                "error": str(error),
-            }
+            return None, str(error)
+
+    def check_unsubscribe_support(
+        self, sender_query: str, user_id: str = "me"
+    ) -> Dict[str, Any]:
+        """Read-only check: does this sender support List-Unsubscribe, and
+        of what kind? Never fires a POST, sends mail, or otherwise acts —
+        safe to call from the weekly report, which only suggests.
+        """
+        headers, error = self._find_representative_headers(sender_query, user_id)
+        if headers is None:
+            return {"supported": False, "kind": error}
+
+        list_unsub = headers.get("List-Unsubscribe")
+        if not list_unsub:
+            return {"supported": False, "kind": "no_header"}
+
+        list_unsub_post = headers.get("List-Unsubscribe-Post", "")
+        https_targets = [
+            t for t in self._parse_list_unsubscribe(list_unsub) if t.lower().startswith("http")
+        ]
+        one_click = "one-click" in list_unsub_post.lower() and bool(https_targets)
+
+        return {"supported": True, "kind": "one_click" if one_click else "manual"}
+
+    def unsubscribe_sender(
+        self, sender_query: str, user_id: str = "me"
+    ) -> Dict[str, Any]:
+        """Attempt to unsubscribe from one sender automatically.
+
+        Looks at a single representative message (unsubscribe targets are
+        per mailing-list, not per message, so one is enough), and:
+          - if the sender supports RFC 8058 one-click unsubscribe, fires the
+            POST directly and reports success/failure
+          - if only a mailto: or a plain web link is available, reports that
+            back rather than guessing — sending an email or loading an
+            unknown page on your behalf are different, riskier actions than
+            reading your own mailbox, so this stops short and tells you
+            instead of acting on it silently.
+
+        Returns a dict with at least a "status" key:
+          not_found | no_header | unsubscribed_one_click | http_error |
+          request_failed | manual_link_only | mailto_only | unknown_format
+        """
+        headers, error = self._find_representative_headers(sender_query, user_id)
+        if headers is None:
+            status = "fetch_failed" if error and error != "not_found" else "not_found"
+            result = {"status": status, "sender": sender_query}
+            if status == "fetch_failed":
+                result["error"] = error
+            return result
 
         from_addr = headers.get("From", sender_query)
         list_unsub = headers.get("List-Unsubscribe")
@@ -837,3 +879,33 @@ class GmailMethod:
             # small delay costs nothing and avoids hammering anyone.
             time.sleep(0.5)
         return results
+
+    # ========================================================
+    # EMAIL SEND — used only by the weekly clutter report to send the
+    # summary to yourself. Not exposed as a general "send to anyone" menu
+    # option — this tool reads and organizes your mailbox, it doesn't
+    # contact other people on your behalf.
+    # ========================================================
+
+    def get_own_email_address(self, user_id: str = "me") -> str:
+        """The authenticated account's own address, so the report always
+        emails the right inbox without hardcoding it.
+        """
+        profile = self.gmailclient.service.users().getProfile(userId=user_id).execute()
+        return profile["emailAddress"]
+
+    def send_email(
+        self, to: str, subject: str, body: str, user_id: str = "me"
+    ) -> Dict[str, Any]:
+        """Send a plain-text email via the Gmail API."""
+        message = MIMEText(body)
+        message["to"] = to
+        message["subject"] = subject
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+        return (
+            self.gmailclient.service.users()
+            .messages()
+            .send(userId=user_id, body={"raw": raw})
+            .execute()
+        )

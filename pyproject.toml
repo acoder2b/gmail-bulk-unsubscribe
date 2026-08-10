@@ -1,7 +1,7 @@
 [project]
 name = "gmail-bulk-unsubscribe"
-version = "0.2.0"
-description = "Clean up your Gmail inbox and bulk-unsubscribe via RFC 8058 one-click List-Unsubscribe. Fork of mxngls/Gmail-Cleaner."
+version = "0.3.0"
+description = "Clean up your Gmail inbox, bulk-unsubscribe via RFC 8058 one-click List-Unsubscribe, and generate an AI-powered weekly clutter report (Anthropic or OpenAI). Fork of mxngls/Gmail-Cleaner."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -10,5 +10,8 @@ dependencies = [
     "google-auth",
     "tqdm",
     "requests",
+    "anthropic",
+    "openai",
+    "python-dotenv",
     "ruff>=0.9.9",
 ]

@@ -2,7 +2,19 @@ import re
 import sys
 from collections import Counter
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass  # optional — env vars can also be exported directly
+
 from methods import GmailMethod
+from report import build_report, format_report_text
+
+# Default AI provider for the weekly clutter report. Override per-run at
+# the prompt, or change this if you want a different default.
+DEFAULT_AI_PROVIDER = "anthropic"
 
 
 def main():
@@ -18,7 +30,8 @@ def main():
 5. Move messages matching a specific label to trash
 6. Add a label to emails matching a specified sender
 7. Bulk-unsubscribe from one or more senders (List-Unsubscribe)
-8. Exit
+8. Generate weekly clutter report (AI-powered, suggests only)
+9. Exit
         """)
 
         try:
@@ -210,6 +223,45 @@ def main():
                         print(f"  - {r.get('from', r['sender'])}: {r.get('error', r.get('code', 'unknown error'))}")
 
             elif user_choice == 8:
+                # Weekly clutter report — suggests only, never acts.
+                provider_name = input(
+                    f"AI provider to use [anthropic/openai] (default: {DEFAULT_AI_PROVIDER}): "
+                ).strip() or DEFAULT_AI_PROVIDER
+
+                limit_raw = input(
+                    "How many top unread senders to analyze? (default: 60): "
+                ).strip()
+                limit = int(limit_raw) if limit_raw else 60
+
+                days_raw = input(
+                    "How many days back should count as \"this week\"? (default: 7): "
+                ).strip()
+                days = int(days_raw) if days_raw else 7
+
+                try:
+                    rows = build_report(
+                        gmail, provider_name=provider_name, limit=limit, days=days
+                    )
+                except Exception as e:
+                    print(f"Could not generate report: {e}")
+                    continue
+
+                report_text = format_report_text(rows)
+                print("\n" + report_text + "\n")
+
+                if input("Email this report to yourself? (yes/no): ").lower() in ["yes", "y"]:
+                    try:
+                        own_address = gmail.get_own_email_address()
+                        gmail.send_email(
+                            to=own_address,
+                            subject="Weekly Gmail Clutter Report",
+                            body=report_text,
+                        )
+                        print(f"Report emailed to {own_address}.")
+                    except Exception as e:
+                        print(f"Could not send email: {e}")
+
+            elif user_choice == 9:
                 # Exit
                 print("Exiting Gmail Cleaner. Goodbye!")
                 sys.exit(0)
