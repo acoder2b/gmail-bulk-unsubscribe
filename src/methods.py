@@ -1,7 +1,9 @@
 import random
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 from googleapiclient.errors import HttpError
 from tqdm import tqdm
 
@@ -320,9 +322,39 @@ class GmailMethod:
                                 counter_name,
                                 getattr(self, counter_name) + len(batch_items),
                             )
+
+                        # Success, break out of retry loop
+                        break
                     else:
+                        # Per-item batch (e.g. "get"): the outer HTTP call can
+                        # succeed even when individual sub-requests inside it
+                        # are rejected (e.g. 403 rate-limited). Those failures
+                        # are reported per-item via the callback, not as an
+                        # exception here, so we track them ourselves and retry
+                        # only the failed subset with backoff.
+                        rate_limited_ids = []
+                        user_callback = op_config.get("callback")
+
+                        def _tracking_callback(
+                            request_id, response, exception, _failed=rate_limited_ids
+                        ):
+                            if exception is not None:
+                                status = getattr(
+                                    getattr(exception, "resp", None), "status", None
+                                )
+                                if status == 429 or status == 403 or (
+                                    status is not None and 500 <= status < 600
+                                ):
+                                    _failed.append(request_id)
+                                    return
+                                print(
+                                    f"Error during {operation} for message {request_id}: {exception}"
+                                )
+                                return
+                            user_callback(request_id, response, None)
+
                         batch = self.gmailclient.service.new_batch_http_request(
-                            callback=op_config.get("callback")
+                            callback=_tracking_callback
                         )
 
                         for item_id in batch_items:
@@ -332,11 +364,39 @@ class GmailMethod:
 
                         batch.execute()
 
-                    # Success, break out of retry loop
-                    break
+                        succeeded = len(batch_items) - len(rate_limited_ids)
+                        processed_count += succeeded
+
+                        if not rate_limited_ids:
+                            # Everything in this batch succeeded (or failed
+                            # with a non-retryable error) — done.
+                            break
+
+                        retry_count += 1
+                        if retry_count > max_retries:
+                            print(
+                                f"Maximum retries exceeded for {len(rate_limited_ids)} "
+                                f"rate-limited messages in batch starting at {start_idx}"
+                            )
+                            break
+
+                        jitter = random.uniform(0.5, 1.5)
+                        sleep_time = wait_time * jitter
+                        print(
+                            f"Rate limit exceeded on {len(rate_limited_ids)} messages, "
+                            f"retrying in {sleep_time:.2f} seconds (attempt {retry_count}/{max_retries})"
+                        )
+                        pbar.set_postfix(
+                            {"status": f"Rate limited, retry {retry_count}"}
+                        )
+                        time.sleep(sleep_time)
+                        wait_time *= 2
+
+                        # Only retry the messages that actually failed
+                        batch_items = rate_limited_ids
 
                 except HttpError as error:
-                    if error.resp.status == 429 or (500 <= error.resp.status < 600):
+                    if error.resp.status == 429 or error.resp.status == 403 or (500 <= error.resp.status < 600):
                         retry_count += 1
 
                         if retry_count > max_retries:
@@ -595,3 +655,168 @@ class GmailMethod:
             True if the label exists, False otherwise
         """
         return any(label["name"] == label_name for label in labels)
+
+    # ========================================================
+    # BULK UNSUBSCRIBE
+    #
+    # Gmail's own "Unsubscribe" button isn't a Gmail feature — it reads the
+    # List-Unsubscribe / List-Unsubscribe-Post headers (RFC 2369 / RFC 8058)
+    # that a compliant sender includes on bulk mail, and either fires a
+    # single background HTTP POST ("one-click unsubscribe") or falls back to
+    # a mailto: link or a manual web page. As of 2024 Google *requires*
+    # bulk senders to support one-click unsubscribe, so a large share of
+    # newsletter/marketing mail can be unsubscribed from programmatically
+    # without ever opening a browser.
+    # ========================================================
+
+    LIST_UNSUBSCRIBE_HEADERS = ["List-Unsubscribe", "List-Unsubscribe-Post", "From"]
+
+    @staticmethod
+    def _parse_list_unsubscribe(header_value: Optional[str]) -> List[str]:
+        """Extract the angle-bracket targets from a List-Unsubscribe header.
+
+        e.g. 'List-Unsubscribe: <https://x.com/u?id=1>, <mailto:u@x.com>'
+        -> ['https://x.com/u?id=1', 'mailto:u@x.com']
+        """
+        if not header_value:
+            return []
+        return re.findall(r"<([^>]+)>", header_value)
+
+    def get_unsubscribe_headers(
+        self, message_id: str, user_id: str = "me"
+    ) -> Dict[str, str]:
+        """Fetch just the List-Unsubscribe headers for one message (cheap —
+        metadata format with an explicit header allowlist, not a full fetch).
+        """
+        msg = (
+            self.gmailclient.service.users()
+            .messages()
+            .get(
+                userId=user_id,
+                id=message_id,
+                format="metadata",
+                metadataHeaders=self.LIST_UNSUBSCRIBE_HEADERS,
+            )
+            .execute()
+        )
+        headers = msg.get("payload", {}).get("headers", [])
+        return {h["name"]: h["value"] for h in headers}
+
+    def unsubscribe_sender(
+        self, sender_query: str, user_id: str = "me"
+    ) -> Dict[str, Any]:
+        """Attempt to unsubscribe from one sender automatically.
+
+        Looks at a single representative message (unsubscribe targets are
+        per mailing-list, not per message, so one is enough), and:
+          - if the sender supports RFC 8058 one-click unsubscribe, fires the
+            POST directly and reports success/failure
+          - if only a mailto: or a plain web link is available, reports that
+            back rather than guessing — sending an email or loading an
+            unknown page on your behalf are different, riskier actions than
+            reading your own mailbox, so this stops short and tells you
+            instead of acting on it silently.
+
+        Returns a dict with at least a "status" key:
+          not_found | no_header | unsubscribed_one_click | http_error |
+          request_failed | manual_link_only | mailto_only | unknown_format
+        """
+        messages = self.list_messages_matching_query(user_id, f"from:{sender_query}")
+        if not messages:
+            return {"status": "not_found", "sender": sender_query}
+
+        try:
+            headers = self.get_unsubscribe_headers(messages[0], user_id)
+        except HttpError as error:
+            return {
+                "status": "fetch_failed",
+                "sender": sender_query,
+                "error": str(error),
+            }
+
+        from_addr = headers.get("From", sender_query)
+        list_unsub = headers.get("List-Unsubscribe")
+        list_unsub_post = headers.get("List-Unsubscribe-Post", "")
+
+        if not list_unsub:
+            return {"status": "no_header", "sender": sender_query, "from": from_addr}
+
+        targets = self._parse_list_unsubscribe(list_unsub)
+        https_targets = [t for t in targets if t.lower().startswith("http")]
+        mailto_targets = [t for t in targets if t.lower().startswith("mailto:")]
+
+        one_click = "one-click" in list_unsub_post.lower()
+
+        if https_targets and one_click:
+            url = https_targets[0]
+            try:
+                resp = requests.post(
+                    url,
+                    data={"List-Unsubscribe": "One-Click"},
+                    timeout=10,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; GmailBulkUnsubscribe/1.0)"
+                    },
+                )
+                if 200 <= resp.status_code < 300:
+                    return {
+                        "status": "unsubscribed_one_click",
+                        "sender": sender_query,
+                        "from": from_addr,
+                        "url": url,
+                    }
+                return {
+                    "status": "http_error",
+                    "sender": sender_query,
+                    "from": from_addr,
+                    "url": url,
+                    "code": resp.status_code,
+                }
+            except requests.RequestException as error:
+                return {
+                    "status": "request_failed",
+                    "sender": sender_query,
+                    "from": from_addr,
+                    "url": url,
+                    "error": str(error),
+                }
+
+        if https_targets:
+            # No List-Unsubscribe-Post header, so no RFC 8058 guarantee that
+            # a POST (or even a GET) is safe/idempotent here. Report it
+            # rather than guess — this is the case that still needs a
+            # browser.
+            return {
+                "status": "manual_link_only",
+                "sender": sender_query,
+                "from": from_addr,
+                "url": https_targets[0],
+            }
+
+        if mailto_targets:
+            # Actually sending mail on your behalf is a different, riskier
+            # action than anything else this tool does. Report the address
+            # instead of sending anything automatically.
+            return {
+                "status": "mailto_only",
+                "sender": sender_query,
+                "from": from_addr,
+                "target": mailto_targets[0],
+            }
+
+        return {"status": "unknown_format", "sender": sender_query, "from": from_addr}
+
+    def bulk_unsubscribe(self, senders: List[str], user_id: str = "me") -> Dict[str, List[Dict[str, Any]]]:
+        """Run unsubscribe_sender() over a list of senders and bucket the
+        results by outcome, so the caller can report a clean summary.
+        """
+        results: Dict[str, List[Dict[str, Any]]] = {}
+        for sender in tqdm(senders, desc="Unsubscribing", unit="sender"):
+            outcome = self.unsubscribe_sender(sender, user_id)
+            results.setdefault(outcome["status"], []).append(outcome)
+            # Be a polite citizen of other people's infrastructure — this
+            # isn't Gmail's API anymore, it's a POST to a third-party
+            # mailing-list host, one per sender, not one per message, so a
+            # small delay costs nothing and avoids hammering anyone.
+            time.sleep(0.5)
+        return results

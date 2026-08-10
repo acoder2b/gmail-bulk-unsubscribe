@@ -17,7 +17,8 @@ def main():
 4. Move all messages from the spam to the trash folder
 5. Move messages matching a specific label to trash
 6. Add a label to emails matching a specified sender
-7. Exit
+7. Bulk-unsubscribe from one or more senders (List-Unsubscribe)
+8. Exit
         """)
 
         try:
@@ -150,6 +151,65 @@ def main():
                 print(f'Attached the label: "{label_name}" to {gmail.labels} e-mails.')
 
             elif user_choice == 7:
+                # Bulk-unsubscribe using List-Unsubscribe / List-Unsubscribe-Post
+                # headers (RFC 2369 / RFC 8058) — no browser required for
+                # senders that support Gmail's own one-click unsubscribe.
+                raw = input(
+                    "Sender(s) to unsubscribe from (comma-separated for multiple): "
+                )
+                senders = [s.strip() for s in raw.split(",") if s.strip()]
+
+                if not senders:
+                    print("No senders entered.")
+                    continue
+
+                results = gmail.bulk_unsubscribe(senders)
+
+                one_click = results.get("unsubscribed_one_click", [])
+                manual_link = results.get("manual_link_only", [])
+                mailto_only = results.get("mailto_only", [])
+                not_found = results.get("not_found", [])
+                no_header = results.get("no_header", [])
+                failed = (
+                    results.get("http_error", [])
+                    + results.get("request_failed", [])
+                    + results.get("fetch_failed", [])
+                    + results.get("unknown_format", [])
+                )
+
+                print(f"\nDone. {len(one_click)}/{len(senders)} unsubscribed automatically (one-click).\n")
+
+                if one_click:
+                    print("Unsubscribed:")
+                    for r in one_click:
+                        print(f"  - {r['from']}")
+
+                if manual_link:
+                    print("\nNo one-click support — open these links to finish manually:")
+                    for r in manual_link:
+                        print(f"  - {r['from']}: {r['url']}")
+
+                if mailto_only:
+                    print("\nUnsubscribe requires sending an email (not done automatically):")
+                    for r in mailto_only:
+                        print(f"  - {r['from']}: {r['target']}")
+
+                if no_header:
+                    print("\nNo List-Unsubscribe header found (sender may not support it):")
+                    for r in no_header:
+                        print(f"  - {r['from']}")
+
+                if not_found:
+                    print("\nNo messages found from:")
+                    for r in not_found:
+                        print(f"  - {r['sender']}")
+
+                if failed:
+                    print("\nFailed / unexpected:")
+                    for r in failed:
+                        print(f"  - {r.get('from', r['sender'])}: {r.get('error', r.get('code', 'unknown error'))}")
+
+            elif user_choice == 8:
                 # Exit
                 print("Exiting Gmail Cleaner. Goodbye!")
                 sys.exit(0)
