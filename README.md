@@ -2,7 +2,7 @@
 
 A command-line tool for cleaning up a Gmail inbox — organizing, trashing, **bulk-unsubscribing** without a browser, and generating an **AI-powered weekly clutter report** that tells you what's worth cleaning up, before you clean it up.
 
-This is a fork of [mxngls/Gmail-Cleaner](https://github.com/mxngls/Gmail-Cleaner) (MIT licensed). The original project handles listing top senders, trashing/spam-flagging by sender or label, and batch processing with rate-limit backoff. This fork keeps all of that and adds the two things that were missing: **actually unsubscribing**, not just deleting, and **judgment about what's safe to clean up**, not just raw send-volume.
+This is a fork of [mxngls/Gmail-Cleaner](https://github.com/mxngls/Gmail-Cleaner) (MIT licensed). The original project handles listing top senders, trashing/spam-flagging by sender or label, and batch processing with rate-limit backoff. This fork keeps all of that and adds three things that were missing: **actually unsubscribing**, not just deleting; **judgment about what's safe to clean up**, not just raw send-volume; and a **hard whitelist** so nothing — not a misclassification, not a careless paste — can touch an address you've explicitly protected.
 
 ## What's new in this fork
 
@@ -34,6 +34,17 @@ export ANTHROPIC_API_KEY=sk-ant-...
 export OPENAI_API_KEY=sk-...
 ```
 Or put them in a `.env` file in the project root (gitignored — never commit it) instead of exporting them each session.
+
+### Whitelist — addresses that are never touched
+
+Neither the AI classifier nor a pasted-in bulk query is infallible, and financial/medical/school mail is exactly the wrong place to find that out the hard way. Menu options **9–11** manage a local `whitelist.txt` — one email address or domain per line (a domain entry also protects its subdomains, e.g. `chase.com` covers `alerts.chase.com` too).
+
+Whitelisted entries are enforced at the point of action, not just suggested:
+- **Trash and spam** (options 2–5): whitelisted senders are filtered out of the message list *before* the API call that would move them, regardless of which menu option or pasted query triggered it
+- **Bulk-unsubscribe** (option 7): checked before any lookup even happens
+- **Weekly report** (option 8): forced to `keep` after classification, overriding whatever the AI said
+
+`whitelist.txt` is gitignored (it reveals real information about you — family, employer, bank), `whitelist.example.txt` is the safe template.
 
 ## Prerequisites
 1. Python 3.13+ (managed automatically if you use `uv`)
@@ -81,12 +92,16 @@ The script offers:
 6. Add a label to emails from a specific sender
 7. **Bulk-unsubscribe from one or more senders** (new)
 8. **Generate weekly clutter report — AI-powered, suggests only** (new)
-9. Exit
+9. **Add an address or domain to the whitelist** (new)
+10. **Remove an entry from the whitelist** (new)
+11. **Show the current whitelist** (new)
+12. Exit
 
 ### Bulk queries in a single run
 Every "sender" prompt in this tool is just concatenated onto `from:`, so you can pass full Gmail search syntax, not just a plain address — e.g. `sender.com after:2023/01/01`, or chain multiple senders with `OR from:` to process them in one run: `a.com OR from:b.com OR from:c.com`.
 
 ## Key Features
+- **Whitelist** — a deterministic, local override that protects specific addresses/domains from trash, spam, unsubscribe, and report suggestions no matter what an AI classifier or pasted query says (new in this fork)
 - **AI-powered weekly clutter report**, provider-agnostic (Anthropic/OpenAI), that classifies senders using real judgment — label-matching, financial/medical/personal exclusions — not just volume (new in this fork)
 - **Bulk unsubscribe** via RFC 8058 one-click `List-Unsubscribe-Post`, with an honest fallback report for senders that don't support it (new in this fork)
 - **Batch processing**: bulk operations use Gmail's batch API to optimize performance and stay within API rate limits
@@ -99,10 +114,10 @@ Every "sender" prompt in this tool is just concatenated onto `from:`, so you can
 - Bulk-unsubscribe can only automate what the sender supports — a plain web-form unsubscribe link still needs a browser; this tool tells you which senders fall into that bucket instead of guessing
 - The weekly report's AI classification is a suggestion, not a guarantee — review it before acting, same as you would anyone else's advice about your inbox
 - The report requires its own API key/billing (Anthropic or OpenAI) separate from anything else — see "Weekly AI clutter report" above
-- Credentials (`credentials.json`, `token.json`, `.env`) are gitignored and stay local — never commit them
+- Credentials (`credentials.json`, `token.json`, `.env`, `whitelist.txt`) are gitignored and stay local — never commit them
 
 ## Credits
-Built on top of [mxngls/Gmail-Cleaner](https://github.com/mxngls/Gmail-Cleaner) — batch processing, rate-limit handling, and the core sender/label/trash operations are from the original project. This fork adds the bulk-unsubscribe feature, the AI-powered weekly clutter report, and their accompanying header-parsing/provider-abstraction/one-click-POST logic.
+Built on top of [mxngls/Gmail-Cleaner](https://github.com/mxngls/Gmail-Cleaner) — batch processing, rate-limit handling, and the core sender/label/trash operations are from the original project. This fork adds the bulk-unsubscribe feature, the AI-powered weekly clutter report, the whitelist, and their accompanying header-parsing/provider-abstraction/one-click-POST/enforcement logic.
 
 ## License
 MIT — see [LICENSE](LICENSE). Original copyright retained per the license terms; this fork's additions are made available under the same license.
