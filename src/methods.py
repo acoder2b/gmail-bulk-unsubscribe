@@ -721,7 +721,24 @@ class GmailMethod:
           not_found | no_header | unsubscribed_one_click | http_error |
           request_failed | manual_link_only | mailto_only | unknown_format
         """
-        messages = self.list_messages_matching_query(user_id, f"from:{sender_query}")
+        # in:anywhere is required here specifically — unlike the trash/spam/
+        # label operations, this one doesn't care whether the message is
+        # sitting in Trash. Unsubscribe targets live in the headers, which
+        # trashing doesn't touch, and a sender you've already bulk-trashed
+        # is exactly the case this needs to keep working for.
+        #
+        # Only one message is ever needed (unsubscribe targets are per
+        # mailing-list, not per message), so this asks the API for exactly
+        # one result instead of reusing the general-purpose paginating
+        # lookup, which would otherwise enumerate every matching message
+        # first — wasted calls and quota for a sender with a large history.
+        response = (
+            self.gmailclient.service.users()
+            .messages()
+            .list(userId=user_id, q=f"from:{sender_query} in:anywhere", maxResults=1)
+            .execute()
+        )
+        messages = [m["id"] for m in response.get("messages", [])]
         if not messages:
             return {"status": "not_found", "sender": sender_query}
 
