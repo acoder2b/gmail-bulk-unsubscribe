@@ -1,11 +1,18 @@
 import re
 import sys
 from collections import Counter
+from pathlib import Path
 
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    # Explicit path, not auto-discovery: load_dotenv()'s default upward
+    # search is unreliable depending on how/where this script is invoked
+    # from, and the README's own instructions (cd into src/, run from
+    # there) are exactly the case where it silently failed to find .env
+    # in the project root during testing. Anchoring to this file's own
+    # location means it works regardless of the caller's cwd.
+    load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 except ImportError:
     pass  # optional — env vars can also be exported directly
 
