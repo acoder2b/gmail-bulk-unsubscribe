@@ -101,6 +101,40 @@ def build_report(
     return rows
 
 
+def _unique_addresses(rows: List[Dict[str, Any]]) -> List[str]:
+    """Sender addresses in order, deduped. The raw sender-count data can
+    contain the same address under slightly different "From" header
+    formatting (seen in practice with dan@tldrnewsletter.com showing up
+    as two entries) — the copy-paste output should list each address once.
+    """
+    seen = set()
+    unique = []
+    for r in rows:
+        addr = r["sender"]
+        if addr and addr not in seen:
+            seen.add(addr)
+            unique.append(addr)
+    return unique
+
+
+def _build_or_query(addresses: List[str]) -> str:
+    """Format addresses as the OR from: chain option 2 (trash) and option 6
+    (label) expect — see README "Bulk queries in a single run".
+    """
+    if not addresses:
+        return ""
+    first, *rest = addresses
+    return " ".join([first] + [f"OR from:{a}" for a in rest])
+
+
+def _build_comma_list(addresses: List[str]) -> str:
+    """Format addresses as the comma-separated list option 7
+    (bulk-unsubscribe) expects — each sender needs its own lookup, so it
+    can't use the OR from: chain (see main.py option 7 for why).
+    """
+    return ", ".join(addresses)
+
+
 def format_report_text(rows: List[Dict[str, Any]]) -> str:
     delete_unsub = [r for r in rows if r["classification"] == "delete_and_unsubscribe"]
     delete_only = [r for r in rows if r["classification"] == "delete_only"]
@@ -129,9 +163,38 @@ def format_report_text(rows: List[Dict[str, Any]]) -> str:
     for r in keep:
         lines.append(f"  - {r['sender']} ({r['unread_count']} unread) — {r['reason']}")
 
+    # Ready-to-paste action lists — the whole point of the report is to
+    # save you from re-typing every sender address by hand into the other
+    # menu options, so generate exactly what each one expects.
+    delete_unsub_addrs = _unique_addresses(delete_unsub)
+    delete_only_addrs = _unique_addresses(delete_only)
+
+    lines.append("")
+    lines.append("=" * 30)
+    lines.append("READY TO PASTE")
+    lines.append("=" * 30)
+
+    if delete_unsub_addrs:
+        lines.append("")
+        lines.append(f"Option 7 (bulk-unsubscribe) — {len(delete_unsub_addrs)} senders, comma-separated:")
+        lines.append(_build_comma_list(delete_unsub_addrs))
+
+        lines.append("")
+        lines.append(f"Option 2 (trash) — same {len(delete_unsub_addrs)} senders, combined query:")
+        lines.append(_build_or_query(delete_unsub_addrs))
+
+    if delete_only_addrs:
+        lines.append("")
+        lines.append(f"Option 2 (trash) — {len(delete_only_addrs)} \"delete only\" senders, combined query:")
+        lines.append(_build_or_query(delete_only_addrs))
+
+    if not delete_unsub_addrs and not delete_only_addrs:
+        lines.append("")
+        lines.append("(Nothing suggested for deletion this run — no action lists to generate.)")
+
     lines.append("")
     lines.append("-" * 30)
     lines.append("This is a suggestion only. Nothing above has been deleted or unsubscribed.")
-    lines.append("To act on any of it, use the trash/unsubscribe menu options with these sender addresses.")
+    lines.append("Paste the lists above into the matching menu option to actually act on any of it.")
 
     return "\n".join(lines)
