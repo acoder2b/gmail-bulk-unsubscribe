@@ -88,12 +88,23 @@ def build_report(
         if classification not in CLASSIFICATIONS:
             classification = "keep"  # fail safe, not fail loud-and-wrong
 
+        # Deterministic override, not another instruction to the LLM: if
+        # this address is whitelisted, it's "keep" no matter what the
+        # classifier said. An AI can be told "never suggest deleting
+        # whitelisted senders" and still get it wrong occasionally; a
+        # local set lookup can't.
+        if gmail.is_whitelisted(addr):
+            classification = "keep"
+            reason = "Whitelisted — never suggested for deletion, regardless of AI classification."
+        else:
+            reason = c.get("reason", "")
+
         rows.append(
             {
                 "sender": addr or base.get("sender", "unknown"),
                 "unread_count": base.get("unread_count", "?"),
                 "classification": classification,
-                "reason": c.get("reason", ""),
+                "reason": reason,
                 "one_click_available": base.get("list_unsubscribe", {}).get("kind") == "one_click",
             }
         )

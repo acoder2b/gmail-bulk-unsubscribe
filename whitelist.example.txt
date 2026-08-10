@@ -1,0 +1,14 @@
+# Copy this file to whitelist.txt and add your own entries.
+# whitelist.txt is gitignored — it never gets committed.
+#
+# One entry per line:
+#   - a line with "@" is an exact address, e.g. boss@company.com
+#   - a line without "@" is a domain, and also protects its subdomains,
+#     e.g. "chase.com" protects chase.com AND alerts.chase.com
+#
+# Anything listed here is never trashed, spammed, unsubscribed from, or
+# suggested for deletion by the weekly report — regardless of AI
+# classification or a pasted-in query.
+
+# example@example.com
+# yourbank.com

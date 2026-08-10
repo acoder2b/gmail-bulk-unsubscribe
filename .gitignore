@@ -2,6 +2,11 @@
 credentials.json
 token.json
 
+# personal — which addresses/domains someone whitelisted reveals real
+# information about them (family, employer, bank, etc.), same reasoning
+# as credentials.json
+whitelist.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

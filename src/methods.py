@@ -10,6 +10,7 @@ from googleapiclient.errors import HttpError
 from tqdm import tqdm
 
 from client import GmailClient
+from whitelist import is_whitelisted, load_whitelist
 
 # fmt: off
 # https://developers.google.com/gmail/api/reference/quota#per-method_quota_usage
@@ -37,6 +38,19 @@ class GmailMethod:
         self.moved_to_spam = 0
         self.deleted = 0
         self.labels = 0
+
+        # Loaded once at startup. Re-run reload_whitelist() if you edit
+        # whitelist.txt without restarting — the trash/spam/label/
+        # unsubscribe operations all check against this, not the file
+        # directly, so an in-memory whitelist that predates an edit
+        # wouldn't reflect it otherwise.
+        self.whitelist_emails, self.whitelist_domains = load_whitelist()
+
+    def reload_whitelist(self):
+        self.whitelist_emails, self.whitelist_domains = load_whitelist()
+
+    def is_whitelisted(self, address: str) -> bool:
+        return is_whitelisted(address, self.whitelist_emails, self.whitelist_domains)
 
     def list_messages(
         self,
@@ -446,24 +460,99 @@ class GmailMethod:
         """
         return self.batch_process(messages, "get", user_id=user_id)
 
+    def get_senders_for_messages(
+        self, message_ids: List[str], user_id: str = "me"
+    ) -> Dict[str, str]:
+        """Fetch just the From header for each message ID, batched. Returns
+        {message_id: sender_string}. Deliberately separate from batch_get(),
+        which appends to self.users for the "show most common senders"
+        feature — this is used for whitelist filtering and shouldn't
+        pollute that shared state.
+        """
+        results: Dict[str, str] = {}
+
+        def _callback(request_id, response, exception):
+            if exception is not None:
+                return
+            headers = (response or {}).get("payload", {}).get("headers", [])
+            for header in headers:
+                if header["name"] == "From":
+                    results[request_id] = header["value"]
+                    break
+
+        for start in range(0, len(message_ids), GET_BATCH_SIZE):
+            batch_items = message_ids[start : start + GET_BATCH_SIZE]
+            batch = self.gmailclient.service.new_batch_http_request(callback=_callback)
+            for item_id in batch_items:
+                batch.add(
+                    self.gmailclient.service.users()
+                    .messages()
+                    .get(userId=user_id, id=item_id, format="metadata", metadataHeaders=["From"]),
+                    request_id=item_id,
+                )
+            batch.execute()
+
+        return results
+
+    def filter_whitelisted_messages(
+        self, message_ids: List[str], user_id: str = "me"
+    ) -> Tuple[List[str], int]:
+        """Remove any message whose sender is whitelisted. Returns
+        (filtered_message_ids, number_removed_because_whitelisted).
+
+        No-ops immediately (zero extra API calls) if the whitelist is
+        empty — using this tool without setting one up costs nothing.
+        """
+        if not message_ids or not (self.whitelist_emails or self.whitelist_domains):
+            return message_ids, 0
+
+        senders = self.get_senders_for_messages(message_ids, user_id)
+
+        kept = []
+        removed = 0
+        for message_id in message_ids:
+            sender = senders.get(message_id, "")
+            match = re.search(r"<(.+)>", sender)
+            address = match.group(1) if match else sender
+            if self.is_whitelisted(address):
+                removed += 1
+            else:
+                kept.append(message_id)
+
+        return kept, removed
+
     def batch_delete(self, messages: List[str], user_id: str = "me"):
         """
         Process messages in batches to move them to trash.
+
+        Whitelisted senders are filtered out first — see
+        filter_whitelisted_messages(). This is the enforcement point for
+        "never delete this," not just a suggestion respected by whichever
+        menu option happened to call it.
 
         Args:
             messages: List of message IDs to move to trash
             user_id: The user's email address (default 'me')
         """
+        messages, skipped = self.filter_whitelisted_messages(messages, user_id)
+        if skipped:
+            print(f"Skipped {skipped} whitelisted message(s) — not moved to trash.")
         return self.batch_process(messages, "trash", user_id=user_id)
 
     def batch_spam(self, messages: List[str], user_id: str = "me"):
         """
         Process messages in batches to move them to spam.
 
+        Whitelisted senders are filtered out first — see
+        filter_whitelisted_messages().
+
         Args:
             messages: List of message IDs to move to spam
             user_id: The user's email address (default 'me')
         """
+        messages, skipped = self.filter_whitelisted_messages(messages, user_id)
+        if skipped:
+            print(f"Skipped {skipped} whitelisted message(s) — not moved to spam.")
         return self.batch_process(messages, "spam", user_id=user_id)
 
     def batch_label(self, messages: List[str], label_id: str, user_id: str = "me"):
@@ -784,7 +873,14 @@ class GmailMethod:
         Returns a dict with at least a "status" key:
           not_found | no_header | unsubscribed_one_click | http_error |
           request_failed | manual_link_only | mailto_only | unknown_format
+          | whitelisted
         """
+        # Checked before any lookup at all — a whitelisted entry should
+        # never even trigger the API calls to look for an unsubscribe
+        # target, not just be denied afterward.
+        if self.is_whitelisted(sender_query):
+            return {"status": "whitelisted", "sender": sender_query, "from": sender_query}
+
         headers, error = self._find_representative_headers(sender_query, user_id)
         if headers is None:
             status = "fetch_failed" if error and error != "not_found" else "not_found"
@@ -794,6 +890,14 @@ class GmailMethod:
             return result
 
         from_addr = headers.get("From", sender_query)
+
+        # Second check on the resolved address: sender_query might have
+        # been a loose match (part of an OR chain, a display name, etc.)
+        # that happens to resolve to a whitelisted address even though the
+        # query string itself didn't obviously look like one.
+        if self.is_whitelisted(from_addr):
+            return {"status": "whitelisted", "sender": sender_query, "from": from_addr}
+
         list_unsub = headers.get("List-Unsubscribe")
         list_unsub_post = headers.get("List-Unsubscribe-Post", "")
 

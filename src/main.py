@@ -18,6 +18,7 @@ except ImportError:
 
 from methods import GmailMethod
 from report import build_report, format_report_text
+from whitelist import add_entry, load_whitelist, remove_entry
 
 # Default AI provider for the weekly clutter report. Override per-run at
 # the prompt, or change this if you want a different default.
@@ -38,7 +39,10 @@ def main():
 6. Add a label to emails matching a specified sender
 7. Bulk-unsubscribe from one or more senders (List-Unsubscribe)
 8. Generate weekly clutter report (AI-powered, suggests only)
-9. Exit
+9. Add an address or domain to the whitelist (never deleted/unsubscribed)
+10. Remove an entry from the whitelist
+11. Show the current whitelist
+12. Exit
         """)
 
         try:
@@ -190,6 +194,7 @@ def main():
                 mailto_only = results.get("mailto_only", [])
                 not_found = results.get("not_found", [])
                 no_header = results.get("no_header", [])
+                whitelisted = results.get("whitelisted", [])
                 failed = (
                     results.get("http_error", [])
                     + results.get("request_failed", [])
@@ -218,6 +223,11 @@ def main():
                     print("\nNo List-Unsubscribe header found (sender may not support it):")
                     for r in no_header:
                         print(f"  - {r['from']}")
+
+                if whitelisted:
+                    print("\nSkipped — whitelisted, never unsubscribed automatically:")
+                    for r in whitelisted:
+                        print(f"  - {r['sender']}")
 
                 if not_found:
                     print("\nNo messages found from:")
@@ -269,6 +279,49 @@ def main():
                         print(f"Could not send email: {e}")
 
             elif user_choice == 9:
+                # Add to whitelist — protects against trash/spam/unsubscribe
+                # (see filter_whitelisted_messages / is_whitelisted in
+                # methods.py) and against the weekly report ever suggesting
+                # deletion, regardless of what the AI classifier says.
+                entry = input(
+                    "Address or domain to whitelist (e.g. boss@company.com or company.com): "
+                ).strip()
+                if not entry:
+                    print("Nothing entered.")
+                    continue
+                add_entry(entry)
+                gmail.reload_whitelist()
+                kind = "address" if "@" in entry else "domain"
+                print(f"Whitelisted {kind}: {entry}")
+                if kind == "domain":
+                    print(f"(This also protects every subdomain of {entry}.)")
+
+            elif user_choice == 10:
+                entry = input("Address or domain to remove from the whitelist: ").strip()
+                if not entry:
+                    print("Nothing entered.")
+                    continue
+                if remove_entry(entry):
+                    gmail.reload_whitelist()
+                    print(f"Removed from whitelist: {entry}")
+                else:
+                    print(f"'{entry}' was not in the whitelist.")
+
+            elif user_choice == 11:
+                emails, domains = load_whitelist()
+                if not emails and not domains:
+                    print("Whitelist is empty.")
+                    continue
+                if emails:
+                    print("\nWhitelisted addresses:")
+                    for e in sorted(emails):
+                        print(f"  - {e}")
+                if domains:
+                    print("\nWhitelisted domains (and their subdomains):")
+                    for d in sorted(domains):
+                        print(f"  - {d}")
+
+            elif user_choice == 12:
                 # Exit
                 print("Exiting Gmail Cleaner. Goodbye!")
                 sys.exit(0)
